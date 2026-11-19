@@ -40,6 +40,9 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
+# eval reports (Module 5)
+/.evals/
+
 # grading output and caches
 .grading/
 .vitest-cache/

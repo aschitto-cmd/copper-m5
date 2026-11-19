@@ -13,6 +13,8 @@ import { costUsd } from "@/lib/ai/pricing";
 // Every model call in the app goes through this file, so each one is logged
 // with its tokens, cost and how long it took. The log goes to the terminal
 // running the app, as a line starting "[ai_calls]".
+// Module 5: each call is also traced in Langfuse (lib/ai/langfuse.ts), named
+// after its feature, like "ask-copper" or "refund-agent".
 
 export class AiNotConfiguredError extends Error {
   constructor() {
@@ -66,6 +68,11 @@ function languageModel(model: ModelId) {
   return google()(id);
 }
 
+/** Names the call in Langfuse after the feature that made it. */
+function telemetryFor(info: { feature: string }) {
+  return { functionId: info.feature };
+}
+
 /** Prints one line per model call, so the cost and time are visible. */
 async function logCall(row: AiCallRow): Promise<void> {
   console.info("[ai_calls]", JSON.stringify(row));
@@ -114,7 +121,11 @@ async function tracked<T extends { usage: Usage }>(
 /** Generates text. Example: callText({ module: 3, feature: "support-answer" }, { prompt }) */
 export async function callText(info: CallInfo, options: TextOptions) {
   return tracked(info, (model) =>
-    generateText({ ...options, model: languageModel(model) }),
+    generateText({
+      ...options,
+      model: languageModel(model),
+      telemetry: telemetryFor(info),
+    }),
   );
 }
 
@@ -129,6 +140,7 @@ export async function callObject<Schema extends z.ZodType>(
       ...rest,
       model: languageModel(model),
       output: Output.object({ schema }),
+      telemetry: telemetryFor(info),
     }),
   );
   // Spreading `rest` loses generateText's output type; Output.object has
@@ -162,6 +174,7 @@ export async function callEmbedMany(
     const result = await embedMany({
       model: google().embedding(EMBEDDING_MODEL.slice("google/".length)),
       values,
+      telemetry: telemetryFor(info),
       providerOptions: {
         google: { outputDimensionality: EMBEDDING_DIMENSIONS },
       },
@@ -190,6 +203,7 @@ export function callStream(info: CallInfo, options: StreamOptions) {
   return streamText({
     ...options,
     model: languageModel(model),
+    telemetry: telemetryFor(info),
     onFinish: ({ totalUsage }) => logCall(row(true, totalUsage)),
     onError: () => logCall(row(false)),
   });

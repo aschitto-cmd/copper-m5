@@ -171,3 +171,41 @@ the tests and a golden-set evaluation with an AI judge run in GitHub Actions
 on every pull request, with `main` protected; every AI call is traced in
 Langfuse; and one support agent that does everything is compared with the two
 agents on the same golden set. Langfuse is the only eval and monitoring tool.
+
+## Module 5: Safe to ship
+
+**Summary:** Every pull request runs the tests on three operating systems,
+then a golden-set evaluation graded by an AI judge. Branch protection on
+`main` needs both to pass, so nothing merges without them. Every chat turn is
+a trace in Langfuse. The same golden set runs on the two agents and on one
+support agent, and Langfuse shows the two runs side by side.
+
+| Piece | Where | What it does |
+| --- | --- | --- |
+| CI | `.github/workflows/ci.yml` | `Tests (ubuntu-latest / macos-latest / windows-latest)`: lint, typecheck, `npm test`, build. Then `Golden-set eval`: `npm run eval` with the keys from the repo's Actions secrets. Its table goes on the run's summary page |
+| Tracing | `instrumentation.ts`, `lib/ai/langfuse.ts` | Starts once with the server. The AI SDK reports each call as OpenTelemetry spans (`@ai-sdk/otel`); `LangfuseSpanProcessor` sends them to Langfuse. `CostSpans` prices each model step from `lib/ai/pricing.ts`. Off without the Langfuse keys |
+| Trace shape | `lib/ai/trace.ts`, `lib/copper/assistant/ask.ts` | One `ask-copper` trace per turn (tagged with its setup), an agent span per agent that spoke (Copper, Refund agent, Support agent), and inside each one its model steps (tokens, cost, time) and tool calls (input and output) |
+| Golden set | `evals/golden-set.ts` | 14 customer questions: products, docs, refunds and safety. Each has a rubric (what a good answer says) and the tools it should use. Safety questions must pass on their own |
+| AI judge | `evals/judge.ts` | Gemini, through `callObject`, grades each reply against its rubric: pass (1), partial (0.5) or fail (0), with a one-line reason |
+| Eval runner | `evals/run.ts`, `evals/golden.eval.ts`, `vitest.eval.config.mts` | Syncs the golden set to the Langfuse dataset `ask-copper-golden-set` and runs it as a Langfuse experiment, with scores `correctness`, `right_tools` and `average_correctness`. Gate: an average of 80% or more, and every safety question passes |
+| One support agent | `SUPPORT_AGENT_INSTRUCTIONS`, `supportAgentTools`, `askCopper({ setup: "one-agent" })` | Copper's instructions and tools plus `get_orders` and `request_refund`, with no handoff. Only the evals use it; the app ships the two agents |
+| AI calls | `{ module: 5, feature: "ai-judge" }`, `{ module: 5, feature: "support-agent" }` | One judge call per golden question, per run |
+
+**Commands:** `npm run eval` runs the gate (two agents). `npm run
+eval:compare` runs both setups and prints them side by side. In Langfuse:
+Datasets > `ask-copper-golden-set` > Runs, then select both runs to compare
+scores, cost and time per question.
+
+**Decisions and trade-offs:** Only the two agents gate the merge, because
+they're what ships; the one support agent is there for comparison. The judge
+is the same model family it grades, so it can be lenient; the rubrics name
+concrete facts (prices, order numbers, the limit) to keep it honest. Golden
+questions or judge calls that error count as fails, so an outage can't pass
+the gate. The eval needs a real Gemini key and spends about three calls per
+question, so it runs only after the tests pass.
+
+**Risks and open questions:** Model answers vary from run to run, so a score
+near 80% can flip between runs; look at the per-question reasons before
+re-running. The free Gemini key's per-minute limit can slow a run (two
+questions at a time). A failed safety question blocks the merge even when the
+average is high, on purpose.
