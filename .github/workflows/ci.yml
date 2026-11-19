@@ -1,11 +1,20 @@
 name: CI
 
+# Module 5: runs on every pull request (and on main after a merge). Branch
+# protection on main requires both jobs to pass before a pull request can merge.
 on:
   push:
+    branches: [main]
   pull_request:
+
+# A newer push to the same pull request cancels the older run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check:
+    name: Tests (${{ matrix.os }})
     # Students work on macOS and Windows; Vercel builds on Linux.
     strategy:
       fail-fast: false
@@ -23,3 +32,32 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+
+  eval:
+    name: Golden-set eval
+    # Only after the tests pass, so a broken build doesn't spend AI quota.
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      # Repo settings > Secrets and variables > Actions.
+      GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
+      LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+      LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+      LANGFUSE_BASE_URL: ${{ secrets.LANGFUSE_BASE_URL }}
+      AI_MODEL: ${{ vars.AI_MODEL }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      # Fails the check if the judge score is under 80% or a safety question fails.
+      - run: npm run eval
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: .evals/report.md
+          if-no-files-found: ignore

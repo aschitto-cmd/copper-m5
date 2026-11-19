@@ -9,25 +9,34 @@
 // talking. Copper can hand the conversation to the Refund agent, a second
 // agent with its own instructions and tools, and the Refund agent can hand it
 // back. The agent that ends the turn answers the next message too.
+// Module 5: each turn is one trace in Langfuse ("ask-copper"), with one
+// "agent" span per agent that spoke, and the model steps and tool calls
+// inside it. The evals can also run the one support agent that does
+// everything (setup "one-agent") to compare it with the two agents.
 import { hasToolCall, stepCountIs } from "ai";
 import { callStream, THOUGHT_SUMMARIES } from "@/lib/ai/call";
 import { createLive, type Live } from "@/lib/ai/live";
+import { trace, traced } from "@/lib/ai/trace";
 import {
   COPPER_HANDOFF,
   COPPER_INSTRUCTIONS,
   REFUND_AGENT_INSTRUCTIONS,
+  SUPPORT_AGENT_INSTRUCTIONS,
 } from "@/lib/copper/assistant/instructions";
-import type {
-  Agent,
-  Progress,
-  ToolStep,
+import {
+  type Agent,
+  AGENT_NAMES,
+  type Progress,
+  type Setup,
+  type ToolStep,
 } from "@/lib/copper/assistant/progress";
 import {
   copperTools,
   refundAgentTools,
+  supportAgentTools,
   transferToRefundAgent,
 } from "@/lib/copper/assistant/tools";
-import type { Desk } from "@/lib/copper/orders";
+import { DEFAULT_LIMIT_USD, type Desk } from "@/lib/copper/orders";
 
 export type ChatMessage = { role: "user" | "assistant"; content: string };
 
@@ -38,6 +47,11 @@ export type AskCopperRequest = {
   desk?: Desk;
   /** Who answers first: whoever ended the last turn. Copper by default. */
   agent?: Agent;
+  /**
+   * Module 5: "two-agents" (Copper plus the Refund agent, the default) or
+   * "one-agent" (one support agent with every tool and no handoff).
+   */
+  setup?: Setup;
 };
 
 export type AskCopperResult = { progress: Live<Progress> };
@@ -63,6 +77,19 @@ const SORRY = "Sorry, something went wrong on my end. Please try again.";
 
 /** One agent's call: its instructions and only its own tools. */
 function agentCall(agent: Agent, messages: ChatMessage[], desk?: Desk) {
+  if (agent === "support")
+    return callStream(
+      { module: 5, feature: "support-agent" },
+      {
+        messages,
+        providerOptions: THOUGHT_SUMMARIES,
+        instructions: SUPPORT_AGENT_INSTRUCTIONS,
+        tools: supportAgentTools(
+          desk ?? { limitUsd: DEFAULT_LIMIT_USD, refunds: [] },
+        ),
+        stopWhen: stepCountIs(MAX_STEPS),
+      },
+    );
   if (agent === "refund" && desk)
     return callStream(
       { module: 4, feature: "refund-agent" },
@@ -95,9 +122,16 @@ export async function askCopper({
   useTools,
   desk,
   agent = "copper",
+  setup = "two-agents",
 }: AskCopperRequest): Promise<AskCopperResult> {
   const { live, update, done } = createLive<Progress>();
-  const first: Agent = desk && useTools ? agent : "copper";
+  const first: Agent = !useTools
+    ? "copper"
+    : setup === "one-agent"
+      ? "support"
+      : desk && agent !== "support"
+        ? agent
+        : "copper";
   const progress: Progress = {
     steps: [],
     reply: "",
@@ -190,42 +224,68 @@ export async function askCopper({
     return handoff;
   }
 
+  /** One agent's turn, as its own "agent" span in the Langfuse trace. */
+  const runAgent = (
+    current: Agent,
+    start: () => ReturnType<typeof callStream>,
+  ) =>
+    traced(AGENT_NAMES[current], "agent", async (span) => {
+      const replyBefore = progress.reply;
+      const next = await follow(current, start());
+      span({
+        output: progress.reply.slice(replyBefore.length) || undefined,
+        metadata: next ? { handedTo: AGENT_NAMES[next] } : undefined,
+      });
+      return next;
+    });
+
+  const question = messages.findLast((m) => m.role === "user")?.content;
+
   // Read the stream in the background, so the panel gets the first update now.
-  void (async () => {
-    try {
-      if (!useTools) {
-        // Without tools, send no instructions either: "always use your
-        // tools" with no tools makes the model answer with nothing.
-        await follow(
-          "copper",
-          callStream(
-            { module: 2, feature: "ask-copper" },
-            { messages, providerOptions: THOUGHT_SUMMARIES },
-          ),
-        );
-      } else {
-        let current = first;
-        for (let handoffs = 0; ; handoffs++) {
-          const next = await follow(
-            current,
-            agentCall(current, messages, desk),
+  // The whole turn is one trace in Langfuse.
+  void trace(
+    { traceName: "ask-copper", tags: [setup], metadata: { setup } },
+    async (turn) => {
+      turn({ input: question });
+      try {
+        if (!useTools) {
+          // Without tools, send no instructions either: "always use your
+          // tools" with no tools makes the model answer with nothing.
+          await runAgent("copper", () =>
+            callStream(
+              { module: 2, feature: "ask-copper" },
+              { messages, providerOptions: THOUGHT_SUMMARIES },
+            ),
           );
-          if (!next || next === current || handoffs >= MAX_HANDOFFS) break;
-          progress.steps.push({ type: "handoff", from: current, to: next });
-          progress.agent = current = next;
-          progress.reply = "";
-          call++;
-          update(snapshot());
+        } else {
+          let current = first;
+          for (let handoffs = 0; ; handoffs++) {
+            const agentNow = current;
+            const next = await runAgent(agentNow, () =>
+              agentCall(agentNow, messages, desk),
+            );
+            if (!next || next === current || handoffs >= MAX_HANDOFFS) break;
+            progress.steps.push({ type: "handoff", from: current, to: next });
+            progress.agent = current = next;
+            progress.reply = "";
+            call++;
+            update(snapshot());
+          }
         }
+        progress.status = "done";
+        if (!progress.reply.trim()) progress.reply = SORRY;
+      } catch {
+        progress.status = "error";
+        if (!progress.reply.trim()) progress.reply = SORRY;
       }
-      progress.status = "done";
-      if (!progress.reply.trim()) progress.reply = SORRY;
-    } catch {
-      progress.status = "error";
-      if (!progress.reply.trim()) progress.reply = SORRY;
-    }
-    done(snapshot());
-  })();
+      turn({
+        output: progress.reply,
+        level: progress.status === "error" ? "ERROR" : undefined,
+        metadata: { agent: AGENT_NAMES[progress.agent ?? "copper"] },
+      });
+      done(snapshot());
+    },
+  );
 
   return { progress: live };
 }

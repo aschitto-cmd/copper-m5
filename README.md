@@ -47,6 +47,8 @@ They're optional until a module needs them. Put them in `.env.local` (never comm
 | `npm run start-module`               | One-time setup after cloning a module branch          |
 | `npm run env:check`                  | List the variables in `.env.local`, values masked     |
 | `npm run embed-docs`                 | Re-embed the PDFs in `public/docs/` after they change |
+| `npm run eval`                       | Module 5: golden set + AI judge (the CI merge gate)   |
+| `npm run eval:compare`               | Module 5: same golden set on two agents vs one agent  |
 
 ## AI coding agents
 
