@@ -47,6 +47,18 @@ describe.skipIf(!ready)("Ask Copper golden set (AI judge)", () => {
       console.log(`\n${markdown}\n`);
       mkdirSync(".evals", { recursive: true });
       writeFileSync(".evals/report.md", markdown);
+      // CI reads this to show the scores on the pull request.
+      writeFileSync(
+        ".evals/report.json",
+        JSON.stringify(
+          reports.map(({ items, ...summary }) => ({
+            ...summary,
+            failed: items.filter((i) => i.verdict !== "pass").map((i) => i.id),
+          })),
+          null,
+          2,
+        ),
+      );
       if (report.url) console.log(`Langfuse: ${report.url}`);
       if (process.env.GITHUB_STEP_SUMMARY && reports.length === SETUPS.length)
         appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${markdown}\n`);

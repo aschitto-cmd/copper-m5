@@ -76,6 +76,18 @@ function telemetryFor(info: { feature: string }) {
 /** Prints one line per model call, so the cost and time are visible. */
 async function logCall(row: AiCallRow): Promise<void> {
   console.info("[ai_calls]", JSON.stringify(row));
+  for (const listener of listeners) listener(row);
+}
+
+const listeners = new Set<(row: AiCallRow) => void>();
+
+/**
+ * Module 5: hears every ai_calls row, so the evals can add up what each setup
+ * cost. Returns a function that stops listening.
+ */
+export function onAiCall(listener: (row: AiCallRow) => void): () => void {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
 }
 
 type Usage = { inputTokens?: number; outputTokens?: number };

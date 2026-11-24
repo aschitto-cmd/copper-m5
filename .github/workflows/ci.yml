@@ -38,8 +38,15 @@ jobs:
     # Only after the tests pass, so a broken build doesn't spend AI quota.
     needs: check
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
+    # To post the scores as a comment on the pull request.
+    permissions:
+      contents: read
+      pull-requests: write
     env:
+      # Both setups run on the same golden set; only the two agents (what
+      # ships) gate the merge. The one support agent is there to compare.
+      EVAL_SETUPS: two-agents,one-agent
       # Repo settings > Secrets and variables > Actions.
       GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
       LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
@@ -55,9 +62,19 @@ jobs:
       - run: npm ci
       # Fails the check if the judge score is under 80% or a safety question fails.
       - run: npm run eval
+      # The scores, on the check itself (pass rate, judge score, time, cost)...
+      - name: Show the scores on the check
+        if: always()
+        run: node scripts/eval-annotations.mjs
+      # ...and as one comment on the pull request, updated on every run.
+      - name: Post the scores on the pull request
+        if: always() && github.event_name == 'pull_request' && hashFiles('.evals/report.md') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr comment ${{ github.event.pull_request.number }} --body-file .evals/report.md --edit-last --create-if-none
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: eval-report
-          path: .evals/report.md
+          path: .evals/
           if-no-files-found: ignore
