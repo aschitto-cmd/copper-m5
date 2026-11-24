@@ -5,6 +5,7 @@
 // compare runs side by side: scores, cost and time per question.
 // Without the keys it runs the same questions and prints the scores here.
 import { LangfuseClient } from "@langfuse/client";
+import { onAiCall } from "@/lib/ai/call";
 import { finalValue } from "@/lib/ai/live";
 import {
   flushTracing,
@@ -56,8 +57,13 @@ export type SetupReport = {
   runName: string;
   url?: string;
   items: ItemReport[];
+  /** Share of questions the judge passed outright. */
+  passRate: number;
+  /** Average judge score: pass 1, partial 0.5, fail 0. */
   average: number;
   toolAccuracy: number;
+  /** What Ask Copper's own AI calls cost for the whole golden set (not the judge). */
+  chatCostUsd: number;
   averageLatencyMs: number;
   failedMustPass: string[];
   passed: boolean;
@@ -154,7 +160,8 @@ function summarize(
   setup: Setup,
   runName: string,
   results: { item: GoldenItem; output: Output; verdict: Verdict }[],
-  url?: string,
+  url: string | undefined,
+  chatCostUsd: number,
 ): SetupReport {
   // A question with no graded answer (the chat or the judge failed) counts as
   // a fail, so an error can never sneak past the gate.
@@ -181,7 +188,9 @@ function summarize(
     runName,
     url,
     items,
+    passRate: mean(items.map((i) => (i.verdict === "pass" ? 1 : 0))),
     average,
+    chatCostUsd,
     toolAccuracy: mean(items.map((i) => (i.rightTools ? 1 : 0))),
     averageLatencyMs: Math.round(mean(items.map((i) => i.latencyMs))),
     failedMustPass,
@@ -199,78 +208,92 @@ export async function runGoldenSet(setup: Setup): Promise<SetupReport> {
   const byQuestion = new Map(GOLDEN_SET.map((i) => [i.question, i]));
   const graded: { item: GoldenItem; output: Output; verdict: Verdict }[] = [];
 
-  const grade = async (question: string, output: Output) => {
-    const item = byQuestion.get(question)!;
-    const verdict = await patiently(() =>
-      judge({
-        question,
-        expected: item.expected,
-        reply: output.reply,
-        tools: output.tools,
-      }),
-    );
-    graded.push({ item, output, verdict });
-    return [
-      {
-        name: "correctness",
-        value: VERDICT_SCORE[verdict.verdict],
-        comment: `${verdict.verdict}: ${verdict.reason}`,
-      },
-      {
-        name: "right_tools",
-        value: usedRightTools(output, item) ? 1 : 0,
-        comment: `Used: ${output.tools.join(", ") || "none"}. Expected: ${item.tools.join(", ") || "any"}.`,
-      },
-    ];
-  };
-
-  if (!isLangfuseConfigured()) {
-    // A question that errors counts as a fail (see summarize) and the run
-    // goes on, the same as in a Langfuse experiment.
-    for (const item of GOLDEN_SET) {
-      try {
-        await grade(item.question, await ask(item.question, setup));
-      } catch (error) {
-        console.warn(`[eval] ${item.id} failed:`, (error as Error).message);
-      }
-    }
-    return summarize(setup, runName, graded);
+  // Add up what the chat itself costs. The judge's calls aren't counted, so
+  // both setups are compared on what customers' questions would cost.
+  let chatCostUsd = 0;
+  const stopListening = onAiCall((row) => {
+    if (row.feature !== "ai-judge") chatCostUsd += row.cost_usd ?? 0;
+  });
+  try {
+    return await runSetup();
+  } finally {
+    stopListening();
   }
 
-  startTracing();
-  const langfuse = new LangfuseClient();
-  const data = await syncDataset(langfuse);
-  const result = await langfuse.experiment.run<Input, Expected>({
-    name: "Ask Copper golden set",
-    runName,
-    description: `${SETUP_LABELS[setup]}, graded by the AI judge (evals/judge.ts).`,
-    metadata: { setup, commit: process.env.GITHUB_SHA ?? "local" },
-    data,
-    // Two at a time keeps under the free Gemini key's requests per minute.
-    maxConcurrency: 2,
-    task: async ({ input }) => ask((input as Input).question, setup),
-    evaluators: [
-      async ({ input, output }) => grade((input as Input).question, output),
-    ],
-    runEvaluators: [
-      async ({ itemResults }) => {
-        const scores = itemResults.flatMap((r) =>
-          r.evaluations.filter((e) => e.name === "correctness"),
-        );
-        const avg =
-          scores.reduce((s, e) => s + Number(e.value), 0) /
-          Math.max(scores.length, 1);
-        return {
-          name: "average_correctness",
-          value: avg,
-          comment: `Merge gate: ${PASS_AVERAGE} or higher, and every safety question passes.`,
-        };
-      },
-    ],
-  });
-  await flushTracing();
-  await langfuse.flush();
-  return summarize(setup, runName, graded, result.experimentUrl);
+  async function runSetup(): Promise<SetupReport> {
+    const grade = async (question: string, output: Output) => {
+      const item = byQuestion.get(question)!;
+      const verdict = await patiently(() =>
+        judge({
+          question,
+          expected: item.expected,
+          reply: output.reply,
+          tools: output.tools,
+        }),
+      );
+      graded.push({ item, output, verdict });
+      return [
+        {
+          name: "correctness",
+          value: VERDICT_SCORE[verdict.verdict],
+          comment: `${verdict.verdict}: ${verdict.reason}`,
+        },
+        {
+          name: "right_tools",
+          value: usedRightTools(output, item) ? 1 : 0,
+          comment: `Used: ${output.tools.join(", ") || "none"}. Expected: ${item.tools.join(", ") || "any"}.`,
+        },
+      ];
+    };
+
+    if (!isLangfuseConfigured()) {
+      // A question that errors counts as a fail (see summarize) and the run
+      // goes on, the same as in a Langfuse experiment.
+      for (const item of GOLDEN_SET) {
+        try {
+          await grade(item.question, await ask(item.question, setup));
+        } catch (error) {
+          console.warn(`[eval] ${item.id} failed:`, (error as Error).message);
+        }
+      }
+      return summarize(setup, runName, graded, undefined, chatCostUsd);
+    }
+
+    startTracing();
+    const langfuse = new LangfuseClient();
+    const data = await syncDataset(langfuse);
+    const result = await langfuse.experiment.run<Input, Expected>({
+      name: "Ask Copper golden set",
+      runName,
+      description: `${SETUP_LABELS[setup]}, graded by the AI judge (evals/judge.ts).`,
+      metadata: { setup, commit: process.env.GITHUB_SHA ?? "local" },
+      data,
+      // Two at a time keeps under the free Gemini key's requests per minute.
+      maxConcurrency: 2,
+      task: async ({ input }) => ask((input as Input).question, setup),
+      evaluators: [
+        async ({ input, output }) => grade((input as Input).question, output),
+      ],
+      runEvaluators: [
+        async ({ itemResults }) => {
+          const scores = itemResults.flatMap((r) =>
+            r.evaluations.filter((e) => e.name === "correctness"),
+          );
+          const avg =
+            scores.reduce((s, e) => s + Number(e.value), 0) /
+            Math.max(scores.length, 1);
+          return {
+            name: "average_correctness",
+            value: avg,
+            comment: `Merge gate: ${PASS_AVERAGE} or higher, and every safety question passes.`,
+          };
+        },
+      ],
+    });
+    await flushTracing();
+    await langfuse.flush();
+    return summarize(setup, runName, graded, result.experimentUrl, chatCostUsd);
+  }
 }
 
 /** A Markdown table of one or more runs, for the terminal and GitHub. */
@@ -279,14 +302,14 @@ export function reportMarkdown(reports: SetupReport[]): string {
   const lines = [
     "## Ask Copper golden set",
     "",
-    "| Setup | Judge score | Right tools | Avg time | Safety | Gate |",
-    "| --- | --- | --- | --- | --- | --- |",
+    "| Setup | Pass rate | Judge score | Right tools | Avg time | Cost (all questions) | Safety | Gate |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ...reports.map(
       (r) =>
-        `| ${r.url ? `[${SETUP_LABELS[r.setup]}](${r.url})` : SETUP_LABELS[r.setup]} | ${pct(r.average)} | ${pct(r.toolAccuracy)} | ${(r.averageLatencyMs / 1000).toFixed(1)} s | ${r.failedMustPass.length ? `failed: ${r.failedMustPass.join(", ")}` : "all pass"} | ${r.passed ? "✅ pass" : "❌ fail"} |`,
+        `| ${r.url ? `[${SETUP_LABELS[r.setup]}](${r.url})` : SETUP_LABELS[r.setup]} | ${pct(r.passRate)} | ${pct(r.average)} | ${pct(r.toolAccuracy)} | ${(r.averageLatencyMs / 1000).toFixed(1)} s | $${r.chatCostUsd.toFixed(4)} |${r.failedMustPass.length ? `failed: ${r.failedMustPass.join(", ")}` : "all pass"} | ${r.passed ? "✅ pass" : "❌ fail"} |`,
     ),
     "",
-    `Gate: judge score ${pct(PASS_AVERAGE)} or higher, and every safety question passes.`,
+    `Gate (two agents, what ships): judge score ${pct(PASS_AVERAGE)} or higher, and every safety question passes. Cost counts Ask Copper's own AI calls, not the judge's. Every run is in Langfuse: Datasets > ${DATASET_NAME} > Runs.`,
   ];
   const icon = { pass: "✅", partial: "🟡", fail: "❌" };
   for (const r of reports) {
